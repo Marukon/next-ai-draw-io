@@ -25,6 +25,7 @@ import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { useDictionary } from "@/hooks/use-dictionary"
 import { getApiEndpoint } from "@/lib/base-path"
+import type { DrawioTheme } from "@/lib/drawio-themes"
 import { i18n, type Locale } from "@/lib/i18n/config"
 import { STORAGE_KEYS } from "@/lib/storage"
 
@@ -63,8 +64,8 @@ const LANGUAGE_LABELS: Record<Locale, string> = {
 interface SettingsDialogProps {
     open: boolean
     onOpenChange: (open: boolean) => void
-    drawioUi: "min" | "sketch"
-    onToggleDrawioUi: () => void
+    drawioUi: DrawioTheme
+    onDrawioUiChange: (theme: DrawioTheme) => void
     darkMode: boolean
     onToggleDarkMode: () => void
     minimalStyle?: boolean
@@ -90,7 +91,7 @@ function SettingsContent({
     open,
     onOpenChange,
     drawioUi,
-    onToggleDrawioUi,
+    onDrawioUiChange,
     darkMode,
     onToggleDarkMode,
     minimalStyle = false,
@@ -432,23 +433,40 @@ function SettingsContent({
                     {/* Draw.io Style */}
                     <SettingItem
                         label={dict.settings.drawioStyle}
-                        description={`${dict.settings.drawioStyleDescription} ${
-                            drawioUi === "min"
-                                ? dict.settings.minimal
-                                : dict.settings.sketch
-                        }`}
+                        description={dict.settings.drawioStyleDescription}
                     >
-                        <Button
-                            id="drawio-ui"
-                            variant="outline"
-                            onClick={onToggleDrawioUi}
-                            className="h-9 w-[120px] rounded-xl border-border-subtle hover:bg-interactive-hover font-normal"
+                        <Select
+                            value={drawioUi}
+                            onValueChange={(v) =>
+                                onDrawioUiChange(v as DrawioTheme)
+                            }
                         >
-                            {dict.settings.switchTo}{" "}
-                            {drawioUi === "min"
-                                ? dict.settings.sketch
-                                : dict.settings.minimal}
-                        </Button>
+                            <SelectTrigger
+                                id="drawio-ui-select"
+                                aria-label={dict.settings.drawioStyle}
+                                className="w-[120px] h-9 rounded-xl"
+                            >
+                                <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="kennedy">
+                                    {dict.settings.themeDefault}
+                                </SelectItem>
+                                <SelectItem value="atlas">Atlas</SelectItem>
+                                <SelectItem value="dark">
+                                    {dict.settings.themeDark}
+                                </SelectItem>
+                                <SelectItem value="min">
+                                    {dict.settings.themeMinimal}
+                                </SelectItem>
+                                <SelectItem value="sketch">
+                                    {dict.settings.themeSketch}
+                                </SelectItem>
+                                <SelectItem value="simple">
+                                    {dict.settings.themeSimple}
+                                </SelectItem>
+                            </SelectContent>
+                        </Select>
                     </SettingItem>
 
                     {/* Diagram Style */}
