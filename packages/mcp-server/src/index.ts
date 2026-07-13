@@ -36,6 +36,7 @@ class XMLSerializerPolyfill {
 }
 ;(globalThis as any).XMLSerializer = XMLSerializerPolyfill
 
+import { createRequire } from "node:module"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import open from "open"
@@ -44,6 +45,7 @@ import {
     applyDiagramOperations,
     type DiagramOperation,
 } from "./diagram-operations.js"
+import { checkEditGate } from "./edit-gate.js"
 import { addHistory } from "./history.js"
 import {
     getState,
@@ -54,6 +56,7 @@ import {
     startHttpServer,
     waitForSync,
 } from "./http-server.js"
+import { parseDrawioFileContent } from "./load-diagram.js"
 import { log } from "./logger.js"
 import {
     addPageToDoc,
@@ -79,13 +82,25 @@ let currentSession: {
     id: string
     xml: string
     version: number
-    lastGetDiagramTime: number // Track when get_diagram was last called (for enforcing workflow)
+    // The exact state-store XML the model last saw (get_diagram) or wrote
+    // itself (create/edit/page CRUD). The store only changes on server
+    // writes or browser pushes (user autosave / sync), so edit_diagram can
+    // detect unseen user edits by comparing the live store against this.
+    // Empty = no diagram context established yet.
+    lastSeenXml: string
 } | null = null
 
-// Create MCP server
+// Create MCP server. The version reported in the MCP handshake is read from
+// package.json so it can never drift from the published npm version again
+// (it sat hardcoded at stale values for most of this package's history).
+// Both src/ (tsx dev) and dist/ (published build) live one level below the
+// package root, so the relative path works in either runtime.
+const require = createRequire(import.meta.url)
+const packageVersion: string = require("../package.json").version
+
 const server = new McpServer({
     name: "next-ai-drawio",
-    version: "0.3.0",
+    version: packageVersion,
 })
 
 // Shared Zod schema fragment for page-targeting parameters.
@@ -158,21 +173,21 @@ server.prompt(
 1. Call start_session to open the browser preview
 2. Use create_new_diagram with either a bare <mxGraphModel> (single page) or a full <mxfile> with one or more <diagram> children (multi-page)
 
+## Opening an Existing .drawio File
+- Use load_diagram with the file path — the server reads and decompresses the file itself; don't read it and pass the XML through create_new_diagram
+- After loading, call get_diagram once before editing (you haven't seen the file's cell IDs yet)
+
 ## Working with Multiple Pages
 - Use list_pages to discover existing pages (id, name, index)
 - Use add_page to append a new page (without losing existing ones — unlike create_new_diagram which REPLACES everything)
 - Use rename_page / delete_page for management
 - edit_diagram, get_diagram, and export_diagram all accept optional page_id / page_name / page_index — when omitted they target the first page
 
-## Adding Elements to an Existing Page
-1. Use edit_diagram with "add" operation, optionally with a page selector
-2. Provide a unique cell_id and complete mxCell XML
-3. No need to call get_diagram first - the server fetches latest state automatically
-
-## Modifying or Deleting Existing Elements
-1. FIRST call get_diagram to see current cell IDs and page structure
-2. THEN call edit_diagram with "update" or "delete" operations
-3. For update, provide the cell_id and complete new mxCell XML
+## Editing a Page (add / update / delete cells)
+1. Call edit_diagram with your operations, optionally with a page selector
+2. If you don't know the current cell IDs or structure, call get_diagram first
+3. For add/update, provide the cell_id and complete mxCell XML
+4. No need to call get_diagram before every edit: the server rejects the edit (with no side effects) if the user changed the diagram in the browser since you last saw it, and tells you to call get_diagram once and retry
 
 ## Important Notes
 - create_new_diagram REPLACES the entire document, including ALL pages - only use for new diagrams. Use add_page to add a tab without losing existing content.
@@ -205,7 +220,7 @@ server.registerTool(
                 id: sessionId,
                 xml: "",
                 version: 0,
-                lastGetDiagramTime: 0,
+                lastSeenXml: "",
             }
 
             // Open browser
@@ -376,10 +391,12 @@ COMMON STYLES:
             // Update session state
             currentSession.xml = xml
             currentSession.version++
-            currentSession.lastGetDiagramTime = Date.now()
 
-            // Push to embedded server state
+            // Push to embedded server state. The model just authored this
+            // exact XML, so record it as seen — edit_diagram may follow
+            // without a redundant get_diagram round-trip.
             setState(currentSession.id, xml)
+            currentSession.lastSeenXml = xml
 
             // Save AI result (no SVG yet - will be captured by browser)
             addHistory(currentSession.id, xml, "")
@@ -417,19 +434,136 @@ COMMON STYLES:
     },
 )
 
+// Tool: load_diagram
+server.registerTool(
+    "load_diagram",
+    {
+        description:
+            "Load a .drawio file from disk into the current session, REPLACING the entire diagram (all pages). " +
+            "The server reads the file directly — you do NOT need to read the file yourself or pass its XML through create_new_diagram. " +
+            "Handles both plain-XML and draw.io's compressed save format.\n\n" +
+            "After loading, call get_diagram before edit_diagram — you haven't seen the file's cell IDs or structure yet.",
+        inputSchema: {
+            path: z
+                .string()
+                .describe(
+                    "Path to the .drawio file to load (e.g., ./diagram.drawio)",
+                ),
+        },
+    },
+    async ({ path }) => {
+        try {
+            if (!currentSession) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "Error: No active session. Please call start_session first.",
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            const fs = await import("node:fs/promises")
+            const nodePath = await import("node:path")
+            const absolutePath = nodePath.resolve(path)
+
+            let content: string
+            try {
+                content = await fs.readFile(absolutePath, "utf-8")
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e)
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Error: Cannot read file ${absolutePath}: ${msg}`,
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            const loaded = parseDrawioFileContent(content)
+            if (!loaded.ok) {
+                return {
+                    content: [{ type: "text", text: `Error: ${loaded.error}` }],
+                    isError: true,
+                }
+            }
+            const xml = loaded.xml
+
+            log.info(
+                `Loading diagram from ${absolutePath} (${xml.length} chars)`,
+            )
+
+            // Save the user's current state before replacing (same flow as
+            // create_new_diagram).
+            const browserState = getState(currentSession.id)
+            if (browserState?.xml) {
+                currentSession.xml = browserState.xml
+            }
+            if (currentSession.xml) {
+                addHistory(
+                    currentSession.id,
+                    currentSession.xml,
+                    browserState?.svg || "",
+                )
+            }
+
+            currentSession.xml = xml
+            currentSession.version++
+            setState(currentSession.id, xml)
+            // Deliberately NOT marking the loaded XML as seen: the model only
+            // supplied a path, so it doesn't know the file's cell IDs. The
+            // edit gate will require one get_diagram before edits.
+            currentSession.lastSeenXml = ""
+
+            addHistory(currentSession.id, xml, "")
+
+            const doc = parseMxfile(xml)
+            const pages = doc ? listPagesFromDoc(doc) : []
+            const pageSummary =
+                pages.length > 0
+                    ? `Pages (${pages.length}): ${pages.map((p) => `[${p.index}] id=${p.id} name="${p.name}" cells=${p.cellCount}`).join(" | ")}`
+                    : "no pages parsed"
+
+            log.info(`Diagram loaded from file (${pageSummary})`)
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Diagram loaded from ${absolutePath}!\n\nThe diagram is now visible in your browser.\n\n${pageSummary}\n\nCall get_diagram before edit_diagram — you haven't seen this file's cell IDs yet.`,
+                    },
+                ],
+            }
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : String(error)
+            log.error("load_diagram failed:", message)
+            return {
+                content: [{ type: "text", text: `Error: ${message}` }],
+                isError: true,
+            }
+        }
+    },
+)
+
 // Tool: edit_diagram
 server.registerTool(
     "edit_diagram",
     {
         description:
             "Edit a specific page in the current diagram by ID-based operations (update/add/delete cells).\n\n" +
-            "⚠️ REQUIRED: You MUST call get_diagram BEFORE this tool!\n" +
-            "This fetches the latest state from the browser including any manual user edits.\n" +
-            "Skipping get_diagram WILL cause user's changes to be LOST.\n\n" +
-            "Workflow:\n" +
-            "1. Call get_diagram to see current cell IDs, page structure, and active page\n" +
-            "2. Use the returned XML to construct your edit operations\n" +
-            "3. Call edit_diagram with your operations and (optionally) a page selector\n\n" +
+            "Freshness: the server remembers the last diagram state you have seen, and rejects this call " +
+            "only if the user edited the diagram in the browser since then. You do NOT need to call " +
+            "get_diagram before every edit — if your view is stale, the call is rejected (with no side " +
+            "effects) and the error tells you to call get_diagram once and retry.\n\n" +
+            "Call get_diagram first only when you don't know the current diagram content (cell IDs, " +
+            "structure) — e.g. the diagram wasn't created in this conversation, or you're unsure your " +
+            "memory of it is accurate.\n\n" +
             "Multi-page targeting:\n" +
             "- page_id / page_name / page_index are optional; when all omitted, the FIRST page is targeted\n" +
             "- Use list_pages to discover what pages exist\n\n" +
@@ -482,27 +616,6 @@ server.registerTool(
                 }
             }
 
-            // Enforce workflow: require get_diagram to be called first
-            const timeSinceGet = Date.now() - currentSession.lastGetDiagramTime
-            if (timeSinceGet > 30000) {
-                // 30 seconds
-                log.warn(
-                    "edit_diagram called without recent get_diagram - rejecting to prevent data loss",
-                )
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text:
-                                "Error: You must call get_diagram first before edit_diagram.\n\n" +
-                                "This ensures you have the latest diagram state including any manual edits the user made in the browser. " +
-                                "Please call get_diagram, then use that XML to construct your edit operations.",
-                        },
-                    ],
-                    isError: true,
-                }
-            }
-
             // Fetch latest state from browser. Re-normalise to mxfile: the
             // embed/sync path can hand back a bare <mxGraphModel>, and adopting
             // it verbatim would silently strip a multi-page document down to
@@ -520,6 +633,37 @@ server.registerTool(
                         {
                             type: "text",
                             text: "Error: No diagram to edit. Please create a diagram first with create_new_diagram.",
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            // Enforce workflow: the model must have seen the current diagram
+            // state. Content comparison instead of a wall-clock timeout —
+            // slow reasoning between get_diagram and edit_diagram is fine as
+            // long as nothing changed in the browser meanwhile (#885).
+            const gate = checkEditGate(
+                currentSession.lastSeenXml,
+                browserState?.xml ?? "",
+            )
+            if (!gate.ok) {
+                log.warn(
+                    gate.reason === "stale"
+                        ? "edit_diagram called with unseen browser changes - rejecting to prevent data loss"
+                        : "edit_diagram called without get_diagram - rejecting to prevent data loss",
+                )
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text:
+                                gate.reason === "stale"
+                                    ? "Error: The diagram changed in the browser since you last fetched it (e.g. manual user edits).\n\n" +
+                                      "Call get_diagram to see the latest state, then rebuild your edit operations on top of it."
+                                    : "Error: You must call get_diagram first before edit_diagram.\n\n" +
+                                      "This ensures you have the latest diagram state including any manual edits the user made in the browser. " +
+                                      "Please call get_diagram, then use that XML to construct your edit operations.",
                         },
                     ],
                     isError: true,
@@ -601,8 +745,10 @@ server.registerTool(
             currentSession.xml = result
             currentSession.version++
 
-            // Push to embedded server
+            // Push to embedded server; the pushed XML is now the latest
+            // state the model has seen.
             setState(currentSession.id, result)
+            currentSession.lastSeenXml = result
 
             // Save AI result (no SVG yet - will be captured by browser)
             addHistory(currentSession.id, result, "")
@@ -641,8 +787,9 @@ server.registerTool(
     {
         description:
             "Get the current diagram XML (fetches latest from browser, including user's manual edits). " +
-            "Call this BEFORE edit_diagram if you need to update or delete existing elements, " +
-            "so you can see the current cell IDs, pages, and structure.\n\n" +
+            "Call this when you don't know the current diagram content (cell IDs, pages, structure) — " +
+            "e.g. before editing a diagram you didn't create in this conversation, or after edit_diagram " +
+            "was rejected because the user changed the diagram in the browser.\n\n" +
             "Returns the full <mxfile> by default. If a page selector is provided, returns just that page's <mxGraphModel> embedded in a one-page <mxfile> wrapper.",
         inputSchema: {
             ...pageSelectorSchema,
@@ -677,9 +824,6 @@ server.registerTool(
                 }
             }
 
-            // Mark that get_diagram was called (for edit_diagram workflow check)
-            currentSession.lastGetDiagramTime = Date.now()
-
             // Fetch latest state from browser, re-normalising to mxfile so a
             // bare <mxGraphModel> pushed back by the embed/sync path doesn't
             // strip page structure (see edit_diagram for the same guard).
@@ -699,6 +843,11 @@ server.registerTool(
                     ],
                 }
             }
+
+            // The model is now looking at the current state. Record the raw
+            // store value — the gate's fast path is plain string equality
+            // against the store, with a structural comparison as fallback.
+            currentSession.lastSeenXml = browserState?.xml || currentSession.xml
 
             const pageSelector = pickPageSelector({
                 page_id,
@@ -1070,11 +1219,11 @@ async function loadMxfileForMutation(): Promise<
             addHistory(sessionRef.id, sessionRef.xml, browserState?.svg || "")
             sessionRef.xml = newXml
             sessionRef.version++
-            // Page CRUD updates the structure that get_diagram would return,
-            // so refresh the workflow timestamp — subsequent edit_diagram
-            // calls don't need a redundant get_diagram round-trip.
-            sessionRef.lastGetDiagramTime = Date.now()
             setState(sessionRef.id, newXml)
+            // The model just wrote this exact state, so mark it as seen —
+            // subsequent edit_diagram calls don't need a redundant
+            // get_diagram round-trip.
+            sessionRef.lastSeenXml = newXml
             addHistory(sessionRef.id, newXml, "")
         },
     }
