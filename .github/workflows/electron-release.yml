@@ -1,14 +1,6 @@
 name: Electron Release
 
-on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version tag (e.g., v0.4.5)"
-        required: false
+
 
 jobs:
   # Mac and Linux: Build and publish directly (no signing needed)
