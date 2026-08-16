@@ -1,8 +1,6 @@
 name: Auto Format
 
-on:
-  pull_request:
-    types: [opened, synchronize]
+
 
 permissions:
   contents: write
