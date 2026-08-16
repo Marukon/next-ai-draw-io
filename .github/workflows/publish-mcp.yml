@@ -4,13 +4,7 @@ name: Publish MCP Server
 # (no token, no OTP). Triggers when packages/mcp-server changes on main;
 # skips silently if the package.json version is already on npm — so a
 # release is just "bump the version in a PR and merge".
-on:
-  push:
-    branches:
-      - main
-    paths:
-      - "packages/mcp-server/**"
-  workflow_dispatch:
+
 
 permissions:
   contents: read
