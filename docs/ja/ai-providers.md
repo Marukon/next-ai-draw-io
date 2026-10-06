@@ -46,6 +46,8 @@ AI_MODEL=gpt-4o
 OPENAI_BASE_URL=https://your-custom-endpoint/v1
 ```
 
+LM Studio などのローカルな OpenAI 互換サーバーも同じ方法で使えます。ベース URL を `http://localhost:1234/v1`（LM Studio の既定ポート）に設定し、API キーには `lm-studio` など空でない任意の値を入力してください。上の環境変数でも、モデル設定画面でも設定できます。
+
 ### AIHubMix
 
 AIHubMix は、単一の API キーで Claude、GPT、Gemini、DeepSeek などのモデルへのアクセスを提供します。
@@ -149,8 +151,10 @@ AZURE_REASONING_SUMMARY=detailed  # 任意: none, brief, detailed
 AWS_REGION=us-west-2
 AWS_ACCESS_KEY_ID=your_access_key_id
 AWS_SECRET_ACCESS_KEY=your_secret_access_key
-AI_MODEL=anthropic.claude-sonnet-4-5-20250514-v1:0
+AI_MODEL=global.anthropic.claude-sonnet-5-5
 ```
+
+最近の Claude モデルは、推論プロファイル（inference profile）の ID でのみ呼び出せます。この ID は `global.` や `us.` などのリージョン接頭辞で始まります。`anthropic.claude-sonnet-5-5` のような接頭辞なしの ID では「on-demand throughput isn't supported」というエラーになります。
 
 注: AWS 上（IAM ロールを持つ Lambda や EC2）では、認証情報は IAM ロールから自動的に取得されます。
 
@@ -177,7 +181,7 @@ AI_MODEL=llama3.2
 任意のカスタム URL:
 
 ```bash
-OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_BASE_URL=http://localhost:11434/api
 ```
 
 ### ModelScope

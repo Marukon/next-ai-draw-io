@@ -61,6 +61,8 @@ Optional custom endpoint (for OpenAI-compatible services):
 OPENAI_BASE_URL=https://your-custom-endpoint/v1
 ```
 
+LM Studio and other local OpenAI-compatible servers work the same way: set the base URL to `http://localhost:1234/v1` (LM Studio's default port) and use any non-empty API key, such as `lm-studio`. This works both in the environment variables above and in the model settings.
+
 ### AIHubMix
 
 AIHubMix provides access to Claude, GPT, Gemini, DeepSeek, and other models through a single API key.
@@ -164,8 +166,10 @@ AZURE_REASONING_SUMMARY=detailed  # Optional: none, brief, detailed
 AWS_REGION=us-west-2
 AWS_ACCESS_KEY_ID=your_access_key_id
 AWS_SECRET_ACCESS_KEY=your_secret_access_key
-AI_MODEL=anthropic.claude-sonnet-4-5-20250514-v1:0
+AI_MODEL=global.anthropic.claude-sonnet-5-5
 ```
+
+Recent Claude models answer only through an inference profile id, which starts with a region prefix such as `global.` or `us.`. The plain id (`anthropic.claude-sonnet-5-5`) fails with "on-demand throughput isn't supported".
 
 Note: On AWS (Lambda, EC2 with IAM role), credentials are automatically obtained from the IAM role.
 
@@ -192,7 +196,7 @@ AI_MODEL=llama3.2
 Optional custom URL:
 
 ```bash
-OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_BASE_URL=http://localhost:11434/api
 ```
 
 ### ModelScope
