@@ -5,15 +5,19 @@ import type {
     ValidationStatus,
 } from "@/components/chat/ValidationCard"
 import type { LoadMode } from "@/contexts/diagram-context"
+import { pageModelXml, pageSelectorFor, placeOnPage } from "@/lib/diagram-pages"
 import type { ValidationResult } from "@/lib/diagram-validator"
 import { formatValidationFeedback } from "@/lib/diagram-validator"
 import { isMxCellXmlComplete } from "@/lib/utils"
+import { foldCells } from "@/packages/mcp-server/src/compact-cells.ts"
 import { editDiagram } from "@/packages/mcp-server/src/edit-diagram.ts"
 import { prepareNewDiagram } from "@/packages/mcp-server/src/new-diagram.ts"
+import { hasCells } from "@/packages/mcp-server/src/pages.ts"
 
 const DEBUG = process.env.NODE_ENV === "development"
 
-// display_diagram replaces the document with this one page
+// The page a drawing is wrapped in; on the canvas it replaces the page the
+// model works on, so the canvas page keeps its own id and name
 const NEW_PAGE = { pageId: "page-1", pageName: "Page-1" }
 
 /**
@@ -81,11 +85,14 @@ interface UseDiagramToolHandlersParams {
     // Failed VLM validations in the current user turn (reset on each user message)
     validationRetryCountRef: RefObject<number>
     chartXMLRef: RefObject<string>
+    // The page the model reads and writes in this turn (the one the user
+    // viewed when it began); null, or absent, means the first page
+    turnPageIdRef?: RefObject<string | null>
     onDisplayChart: (
         xml: string,
         skipValidation?: boolean,
         mode?: LoadMode,
-        meta?: { toolCallId?: string },
+        meta?: { toolCallId?: string; pageId?: string | null },
     ) => string | null
     onFetchChart: () => Promise<string>
     captureValidationPng?: () => Promise<string | null>
@@ -117,6 +124,7 @@ export function useDiagramToolHandlers({
     processedToolCallsRef,
     validationRetryCountRef,
     chartXMLRef,
+    turnPageIdRef,
     onDisplayChart,
     onFetchChart,
     captureValidationPng,
@@ -180,10 +188,28 @@ export function useDiagramToolHandlers({
     const commit = (xml: string, toolCallId: string) => {
         const original = continuationOriginalRef.current
         if (original !== null) onDisplayChart(original, true, "revert")
-        const error = onDisplayChart(xml, true, "commit", { toolCallId })
+        const error = onDisplayChart(xml, true, "commit", {
+            toolCallId,
+            pageId: aiPageId(),
+        })
         if (!error) continuationOriginalRef.current = null
         return error
     }
+
+    const aiPageId = () => turnPageIdRef?.current ?? null
+
+    // The diagram as the model sees it in the chat request: its page only
+    const shownToModel = (xml: string) =>
+        foldCells(pageModelXml(xml, aiPageId()) ?? xml)
+
+    // A drawn page goes onto the model's page of the canvas file, which
+    // keeps its other pages; a drawing that brings several pages replaces
+    // the file, and gets its variables
+    const onAiPage = (drawnXml: string) =>
+        keepFileVars(
+            placeOnPage(drawnXml, chartXMLRef.current, aiPageId()),
+            chartXMLRef.current,
+        )
 
     const takeOriginals = (): string | undefined => {
         const [originalXml] = editDiagramOriginalXmlRef.current.values()
@@ -263,10 +289,7 @@ NEXT STEP: Call append_diagram with the continuation XML.
         // finds the diagram already in place
         const prepared = prepareNewDiagram(finalXml, NEW_PAGE)
         const validationError = prepared.ok
-            ? commit(
-                  keepFileVars(prepared.xml, chartXMLRef.current),
-                  toolCall.toolCallId,
-              )
+            ? commit(onAiPage(prepared.xml), toolCall.toolCallId)
             : prepared.error
 
         if (validationError) {
@@ -501,8 +524,12 @@ ${finalXml}
             }
 
             // All or nothing, checked like the MCP server's edit_diagram.
-            // The model sees the first page, so edits target it.
-            const outcome = editDiagram(currentXml, operations, {})
+            // The model sees its page, so edits target it.
+            const outcome = editDiagram(
+                currentXml,
+                operations,
+                pageSelectorFor(currentXml, aiPageId()),
+            )
             if (!outcome.ok) {
                 const reason = outcome.pageError
                     ? outcome.errors[0]
@@ -516,7 +543,7 @@ ${finalXml}
 
 Current diagram XML:
 \`\`\`xml
-${currentXml}
+${shownToModel(currentXml)}
 \`\`\`
 
 Please check the cell IDs and retry.`,
@@ -545,7 +572,7 @@ Please check the cell IDs and retry.`,
 
 Current diagram XML:
 \`\`\`xml
-${currentXml || "No XML available"}
+${currentXml ? shownToModel(currentXml) : "No XML available"}
 \`\`\`
 
 Please check cell IDs and retry, or use display_diagram to regenerate.`,
@@ -575,7 +602,10 @@ Use display_diagram to create the complete diagram, or edit_diagram to change th
         // Detect if LLM incorrectly started fresh instead of continuing
         // LLM should only output bare mxCells now, so wrapper tags indicate error
         const trimmed = xml.trim()
+        // Definitions at the start are a restart only once cells were written
         const isFreshStart =
+            (trimmed.startsWith("<mxStyle") &&
+                hasCells(partialXmlRef.current)) ||
             trimmed.startsWith("<mxGraphModel") ||
             trimmed.startsWith("<root") ||
             trimmed.startsWith("<mxfile") ||
@@ -615,10 +645,7 @@ Start your continuation with the NEXT character after where it stopped.`,
             // originals, so the preview code undoes none of them later
             const originalXml = takeOriginals()
             const validationError = prepared.ok
-                ? commit(
-                      keepFileVars(prepared.xml, chartXMLRef.current),
-                      toolCall.toolCallId,
-                  )
+                ? commit(onAiPage(prepared.xml), toolCall.toolCallId)
                 : prepared.error
 
             if (validationError) {
