@@ -18,7 +18,7 @@ import {
 import { getXmlSyntaxError } from "./xml-syntax.ts"
 
 export type LoadResult =
-    | { ok: true; xml: string }
+    | { ok: true; xml: string; hadCompressedPages: boolean }
     | { ok: false; error: string }
 
 /**
@@ -44,10 +44,26 @@ export function decompressPageContent(compressed: string): string | null {
 }
 
 /**
+ * Read the diagram XML a .drawio.svg (Editable SVG) carries in its root
+ * element's content attribute. Returns undefined when the text is not an
+ * SVG, and "" when the SVG has no embedded diagram.
+ *
+ * Uses getAttributeNode().value rather than getAttribute(): linkedom's
+ * getAttribute re-escapes <, > and & in XML documents, which would turn
+ * the embedded "<mxfile" into "&lt;mxfile".
+ */
+export function extractSvgEmbeddedXml(text: string): string | undefined {
+    const doc = new DOMParser().parseFromString(text, "text/xml")
+    const root = doc.documentElement
+    if (root?.tagName !== "svg") return undefined
+    return (root.getAttributeNode("content")?.value ?? "").trim()
+}
+
+/**
  * Parse the content of a .drawio file into the canonical session shape:
  * an <mxfile> whose every page holds plain <mxGraphModel> XML. Accepts a
- * bare <mxGraphModel> (wrapped into a one-page mxfile) and decompresses
- * any compressed pages.
+ * bare <mxGraphModel> (wrapped into a one-page mxfile), a .drawio.svg with
+ * the diagram embedded, and decompresses any compressed pages.
  */
 export function parseDrawioFileContent(content: string): LoadResult {
     let trimmed = content.trim()
@@ -62,9 +78,25 @@ export function parseDrawioFileContent(content: string): LoadResult {
         trimmed = normalized
     }
     if (!isMxFile(trimmed)) {
+        const embedded = extractSvgEmbeddedXml(trimmed)
+        if (embedded === undefined) {
+            return {
+                ok: false,
+                error: "Not a draw.io file: expected an <mxfile> or <mxGraphModel> root element, or a .drawio.svg with the diagram embedded.",
+            }
+        }
+        if (!embedded) {
+            return {
+                ok: false,
+                error: "This SVG has no embedded diagram. Only .drawio.svg (Editable SVG) files can be loaded; ask for the .drawio file or redraw from the image.",
+            }
+        }
+        if (isMxFile(embedded) || isMxGraphModel(embedded)) {
+            return parseDrawioFileContent(embedded)
+        }
         return {
             ok: false,
-            error: "Not a draw.io file: expected an <mxfile> or <mxGraphModel> root element.",
+            error: "The SVG's embedded content is not draw.io XML.",
         }
     }
     const doc = parseMxfile(trimmed)
@@ -101,5 +133,9 @@ export function parseDrawioFileContent(content: string): LoadResult {
         decompressedAny = true
     }
     // Nothing changed — keep the file's own serialisation.
-    return { ok: true, xml: decompressedAny ? serializeMxfile(doc) : trimmed }
+    return {
+        ok: true,
+        xml: decompressedAny ? serializeMxfile(doc) : trimmed,
+        hadCompressedPages: decompressedAny,
+    }
 }
